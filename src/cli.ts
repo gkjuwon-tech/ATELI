@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { runAgent } from "./agent/runner.js";
 import { listMessages, listTasks, listToolCalls, getTask } from "./storage/tasks.js";
 import { loadConfig } from "./config.js";
+import { indexRepo } from "./rag/indexer.js";
 
 const program = new Command();
 program
@@ -55,6 +56,51 @@ program
       process.stdout.write(
         `${t.id}\t${t.status.padEnd(10)}\t${when}\t${truncate(t.prompt, 60)}\n`,
       );
+    }
+  });
+
+program
+  .command("index")
+  .description("Index a repo for RAG retrieval (real Voyage AI embeddings)")
+  .requiredOption("--repo-id <id>", "Logical repo identifier (used to scope retrieval)")
+  .requiredOption("--path <path>", "Local path to the repo on disk")
+  .action(async (opts: { repoId: string; path: string }) => {
+    try {
+      loadConfig();
+      const stats = await indexRepo({ repoId: opts.repoId, repoRoot: opts.path });
+      process.stdout.write(JSON.stringify(stats, null, 2) + "\n");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`ateli: ${msg}\n`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("serve")
+  .description("Start the ateli HTTP API + web dashboard")
+  .action(async () => {
+    try {
+      loadConfig();
+      await import("./server.js");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`ateli: ${msg}\n`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("slack")
+  .description("Start the ateli Slack bot (socket mode)")
+  .action(async () => {
+    try {
+      loadConfig();
+      await import("./surfaces/slack/start.js");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`ateli: ${msg}\n`);
+      process.exit(1);
     }
   });
 

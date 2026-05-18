@@ -14,6 +14,7 @@ import {
 } from "../storage/tasks.js";
 import { systemPrompt } from "./prompts.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
+import { eventBus } from "../events/bus.js";
 
 export interface RunOptions {
   prompt: string;
@@ -68,7 +69,11 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     source: opts.source,
     source_ref: opts.source_ref,
   });
-  opts.onEvent?.({ type: "task_created", task });
+  const emit = (event: AgentEvent) => {
+    opts.onEvent?.(event);
+    eventBus.publish(task.id, event);
+  };
+  emit({ type: "task_created", task });
   log.info({ task_id: task.id }, "task created");
 
   updateTaskStatus(task.id, "running");
@@ -91,7 +96,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   try {
     while (turn < cfg.ATELI_MAX_TURNS) {
       turn++;
-      opts.onEvent?.({ type: "turn_started", turn });
+      emit({ type: "turn_started", turn });
       log.debug({ turn }, "turn start");
 
       const response = await client.messages.create({
@@ -107,7 +112,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         response.usage.input_tokens,
         response.usage.output_tokens,
       );
-      opts.onEvent?.({
+      emit({
         type: "usage",
         turn,
         input_tokens: response.usage.input_tokens,
@@ -122,7 +127,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       for (const block of response.content) {
         if (block.type === "text") {
           turnText += block.text;
-          opts.onEvent?.({ type: "assistant_text", turn, text: block.text });
+          emit({ type: "assistant_text", turn, text: block.text });
         } else if (block.type === "tool_use") {
           toolUses.push(block);
         }
@@ -143,7 +148,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
           tool_name: use.name,
           input: use.input,
         });
-        opts.onEvent?.({
+        emit({
           type: "tool_call",
           turn,
           tool_name: use.name,
@@ -161,7 +166,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
           is_error: result.is_error,
           duration_ms: duration,
         });
-        opts.onEvent?.({
+        emit({
           type: "tool_result",
           turn,
           tool_use_id: use.id,
@@ -194,7 +199,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       finish_reason: finishReason ?? "end_turn",
     });
     const final = (await import("../storage/tasks.js")).getTask(task.id)!;
-    opts.onEvent?.({ type: "task_finished", task: final });
+    emit({ type: "task_finished", task: final });
     log.info(
       { task_id: task.id, turns: turn, finish_reason: finishReason },
       "task finished",
@@ -204,7 +209,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     const msg = err instanceof Error ? err.message : String(err);
     updateTaskStatus(task.id, "failed", { error: msg });
     const final = (await import("../storage/tasks.js")).getTask(task.id)!;
-    opts.onEvent?.({ type: "task_finished", task: final });
+    emit({ type: "task_finished", task: final });
     log.error({ task_id: task.id, err: msg }, "task failed");
     throw err;
   }
