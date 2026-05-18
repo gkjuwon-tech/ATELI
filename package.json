@@ -1,0 +1,42 @@
+{
+  "name": "ateli",
+  "version": "0.1.0",
+  "description": "Hi-end cloud-native AI software engineering agent",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ateli": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "serve": "tsx src/server.ts",
+    "slack": "tsx src/surfaces/slack/start.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.1",
+    "@hono/node-server": "^1.13.7",
+    "@octokit/rest": "^21.0.2",
+    "@slack/bolt": "^4.2.0",
+    "better-sqlite3": "^11.7.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "hono": "^4.6.14",
+    "ignore": "^6.0.2",
+    "nanoid": "^5.0.9",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "sqlite-vec": "^0.1.6",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
