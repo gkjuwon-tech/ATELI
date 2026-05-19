@@ -6,6 +6,7 @@ import { getDb } from "../storage/db.js";
 import { childLogger } from "../logger.js";
 import { embed } from "./embed.js";
 import { deleteVectorsForFile, upsertVector } from "./vector.js";
+import { smartChunks } from "./chunker.js";
 
 type IgnoreFactory = (...args: never[]) => {
   add: (patterns: string | string[]) => void;
@@ -29,9 +30,7 @@ const TEXT_EXTS = new Set([
   ".dockerfile",
 ]);
 
-const MAX_FILE_BYTES = 1_000_000; // 1 MB per file
-const CHUNK_LINES = 60;
-const CHUNK_OVERLAP = 10;
+const MAX_FILE_BYTES = 1_000_000;
 
 export interface IndexStats {
   scanned: number;
@@ -86,7 +85,6 @@ export async function indexRepo(opts: {
     let content: string;
     try {
       const buf = readFileSync(abs);
-      // skip binary
       if (buf.subarray(0, 8192).includes(0)) continue;
       content = buf.toString("utf8");
     } catch (e) {
@@ -109,7 +107,6 @@ export async function indexRepo(opts: {
     let fileId: number;
     if (existing) {
       fileId = existing.id;
-      // wipe old chunks + vectors for re-index
       deleteVectorsForFile(fileId);
       db.prepare(`DELETE FROM rag_chunks WHERE file_id = ?`).run(fileId);
       db.prepare(
@@ -125,26 +122,35 @@ export async function indexRepo(opts: {
     }
     stats.reindexed++;
 
-    const chunks = chunkText(content);
+    const chunks = smartChunks({ path: rel, content });
     const insertChunk = db.prepare(
-      `INSERT INTO rag_chunks (file_id, chunk_index, start_line, end_line, text)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO rag_chunks (file_id, chunk_index, start_line, end_line, text, symbol, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (let i = 0; i < chunks.length; i++) {
       const c = chunks[i]!;
-      const r = insertChunk.run(fileId, i, c.startLine, c.endLine, c.text);
+      const r = insertChunk.run(
+        fileId,
+        i,
+        c.startLine,
+        c.endLine,
+        c.text,
+        c.symbol ?? null,
+        c.kind,
+      );
       const chunkRowId = Number(r.lastInsertRowid);
-      // prepend path context to help retrieval
+      const header = c.symbol
+        ? `// file: ${rel} (${c.kind} ${c.symbol}, lines ${c.startLine}-${c.endLine})`
+        : `// file: ${rel} (lines ${c.startLine}-${c.endLine})`;
       allChunks.push({
         fileId,
         chunkRowId,
-        text: `// file: ${rel} (lines ${c.startLine}-${c.endLine})\n${c.text}`,
+        text: `${header}\n${c.text}`,
       });
       stats.chunks++;
     }
   }
 
-  // embed in batches
   if (allChunks.length > 0) {
     log.info({ chunks: allChunks.length }, "embedding chunks");
     const embedResult = await embed(
@@ -159,29 +165,6 @@ export async function indexRepo(opts: {
 
   log.info({ repo: opts.repoId, ...stats }, "index complete");
   return stats;
-}
-
-function chunkText(content: string): {
-  startLine: number;
-  endLine: number;
-  text: string;
-}[] {
-  const lines = content.split("\n");
-  if (lines.length <= CHUNK_LINES) {
-    return [{ startLine: 1, endLine: lines.length, text: content }];
-  }
-  const out: { startLine: number; endLine: number; text: string }[] = [];
-  const step = CHUNK_LINES - CHUNK_OVERLAP;
-  for (let i = 0; i < lines.length; i += step) {
-    const end = Math.min(i + CHUNK_LINES, lines.length);
-    out.push({
-      startLine: i + 1,
-      endLine: end,
-      text: lines.slice(i, end).join("\n"),
-    });
-    if (end === lines.length) break;
-  }
-  return out;
 }
 
 function walk(
