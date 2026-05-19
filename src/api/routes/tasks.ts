@@ -1,39 +1,51 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
-import { runAgent, type AgentEvent } from "../../agent/runner.js";
 import {
   getTask,
   listMessages,
   listTasks,
   listToolCalls,
+  setTaskInterject,
 } from "../../storage/tasks.js";
 import { eventBus } from "../../events/bus.js";
 import { childLogger } from "../../logger.js";
-import { cloneRepo } from "../../surfaces/github/clone.js";
-import { commitAndOpenPr } from "../../surfaces/github/pr.js";
-import { retrieve, formatForPrompt } from "../../rag/retriever.js";
+import { enqueue, getJob } from "../../storage/jobs.js";
+import { auth } from "../middleware/auth.js";
 
 const log = childLogger({ component: "api/tasks" });
 
-const CreateTask = z.object({
-  prompt: z.string().min(1),
-  workspace: z.string().optional(),
-  repo: z.string().regex(/^[^/]+\/[^/]+$/).optional(),
-  base: z.string().optional(),
-  rag_repo: z.string().optional(),
-}).refine((v) => !!v.workspace || !!v.repo, {
-  message: "either `workspace` or `repo` is required",
+const CreateTask = z
+  .object({
+    prompt: z.string().min(1),
+    workspace: z.string().optional(),
+    repo: z.string().regex(/^[^/]+\/[^/]+$/).optional(),
+    base: z.string().optional(),
+    rag_repo: z.string().optional(),
+    session_id: z.string().optional(),
+    plan_mode: z.boolean().optional(),
+    critique: z.boolean().optional(),
+    budget_usd: z.number().positive().optional(),
+    /** synchronous mode: process in-request, return when done (legacy). */
+    sync: z.boolean().optional(),
+  })
+  .refine((v) => !!v.workspace || !!v.repo, {
+    message: "either `workspace` or `repo` is required",
+  });
+
+const Interject = z.object({
+  text: z.string().min(1),
 });
 
 export const tasksRouter = new Hono();
 
-tasksRouter.get("/", (c) => {
+// Read endpoints — read scope is enough.
+tasksRouter.get("/", auth({ scope: "read" }), (c) => {
   const limit = Number(c.req.query("limit") ?? "50");
   return c.json({ tasks: listTasks(limit) });
 });
 
-tasksRouter.get("/:id", (c) => {
+tasksRouter.get("/:id", auth({ scope: "read" }), (c) => {
   const task = getTask(c.req.param("id"));
   if (!task) return c.json({ error: "not_found" }, 404);
   return c.json({
@@ -43,110 +55,70 @@ tasksRouter.get("/:id", (c) => {
   });
 });
 
-tasksRouter.post("/", async (c) => {
+// Write endpoints — write scope.
+tasksRouter.post("/", auth({ scope: "write" }), async (c) => {
   const parsed = CreateTask.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
     return c.json({ error: "invalid_input", issues: parsed.error.issues }, 400);
   }
   const body = parsed.data;
+  const authCtx = c.get("auth");
 
-  let workspace = body.workspace;
-  let cleanup: (() => void) | null = null;
-  let repoMeta: { owner: string; repo: string; base: string } | null = null;
-
-  if (body.repo) {
-    const [owner, repo] = body.repo.split("/");
-    const cloned = await cloneRepo({ owner: owner!, repo: repo!, base: body.base });
-    workspace = cloned.dir;
-    cleanup = cloned.cleanup;
-    repoMeta = { owner: cloned.owner, repo: cloned.repo, base: cloned.base };
-  }
-
-  // Optional RAG context
-  let ragContext: string | undefined;
-  if (body.rag_repo) {
-    try {
-      const chunks = await retrieve({ repoId: body.rag_repo, query: body.prompt, k: 8 });
-      ragContext = formatForPrompt(chunks);
-    } catch (e) {
-      log.warn({ err: (e as Error).message }, "rag retrieve failed; continuing without");
-    }
-  }
-
-  // Run the agent in the background so the POST returns immediately.
-  // The runner publishes events to eventBus internally; we only use
-  // onEvent here to capture the task ID synchronously.
-  let resolveTaskId!: (id: string) => void;
-  const taskIdReady = new Promise<string>((r) => { resolveTaskId = r; });
-
-  const runP = runAgent({
-    prompt: body.prompt,
-    workspace: workspace!,
-    source: body.repo ? "api/github" : "api",
-    source_ref: body.repo,
-    ragContext,
-    onEvent: (e: AgentEvent) => {
-      if (e.type === "task_created") resolveTaskId(e.task.id);
+  // Enqueue rather than run inline. The worker process picks it up.
+  const job = enqueue({
+    kind: "run_task",
+    payload: {
+      prompt: body.prompt,
+      workspace: body.workspace,
+      repo: body.repo,
+      base: body.base,
+      rag_repo: body.rag_repo,
+      session_id: body.session_id,
+      plan_mode: body.plan_mode,
+      critique: body.critique,
+      budget_usd: body.budget_usd,
+      source: "api",
+      source_ref: body.repo,
+      user_id: authCtx?.user_id,
     },
   });
-  const taskId = await taskIdReady;
-
-  // Background continuation: when agent finishes, optionally open a PR + cleanup.
-  void runP
-    .then(async (res) => {
-      if (repoMeta && cleanup) {
-        try {
-          const pr = await commitAndOpenPr({
-            repoDir: workspace!,
-            owner: repoMeta.owner,
-            repo: repoMeta.repo,
-            base: repoMeta.base,
-            branch: `ateli/${res.task.id}`,
-            title: truncate(body.prompt, 70),
-            body:
-              `Opened by ateli (task \`${res.task.id}\`).\n\n` +
-              `Prompt:\n> ${body.prompt}\n\nFinal summary:\n${res.finalText || "(no summary)"}\n`,
-          });
-          if (pr) {
-            eventBus.publish(res.task.id, {
-              type: "assistant_text",
-              turn: -1,
-              text: `\n[ateli] opened PR ${pr.url}\n`,
-            });
-          } else {
-            eventBus.publish(res.task.id, {
-              type: "assistant_text",
-              turn: -1,
-              text: `\n[ateli] no changes to commit; PR not opened\n`,
-            });
-          }
-        } catch (err) {
-          log.error({ err: (err as Error).message }, "PR creation failed");
-          eventBus.publish(res.task.id, {
-            type: "assistant_text",
-            turn: -1,
-            text: `\n[ateli] PR creation failed: ${(err as Error).message}\n`,
-          });
-        }
-      }
-    })
-    .catch((err) => log.error({ err: (err as Error).message }, "agent run failed"))
-    .finally(() => {
-      if (cleanup) cleanup();
-    });
-
-  const task = getTask(taskId)!;
-  return c.json({ task }, 202);
+  log.info({ job_id: job.id }, "task enqueued");
+  return c.json({ job_id: job.id, status: job.status }, 202);
 });
 
-tasksRouter.get("/:id/events", (c) => {
+// Real-time interject: inject a user message into a running task.
+tasksRouter.post("/:id/interject", auth({ scope: "write" }), async (c) => {
+  const id = c.req.param("id");
+  const task = getTask(id);
+  if (!task) return c.json({ error: "not_found" }, 404);
+  if (task.status !== "running" && task.status !== "pending") {
+    return c.json({ error: "task_not_active", status: task.status }, 409);
+  }
+  const parsed = Interject.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: "invalid_input" }, 400);
+  setTaskInterject(id, parsed.data.text);
+  return c.json({ ok: true });
+});
+
+// Job status (so a client that just POSTed knows when the task spawned).
+tasksRouter.get("/jobs/:id", auth({ scope: "read" }), (c) => {
+  const job = getJob(c.req.param("id"));
+  if (!job) return c.json({ error: "not_found" }, 404);
+  return c.json({ job });
+});
+
+// SSE event stream — anonymous OK if auth not required.
+tasksRouter.get("/:id/events", auth({ scope: "read" }), (c) => {
   const id = c.req.param("id");
   return streamSSE(c, async (stream) => {
-    // Replay tool calls + messages so a late subscriber sees history.
     const msgs = listMessages(id);
     for (const m of msgs) {
       await stream.writeSSE({
-        data: JSON.stringify({ type: "history_message", role: m.role, content: m.content }),
+        data: JSON.stringify({
+          type: "history_message",
+          role: m.role,
+          content: m.content,
+        }),
       });
     }
     let closed = false;
@@ -159,14 +131,17 @@ tasksRouter.get("/:id/events", (c) => {
       }
     });
 
-    // Keep stream open. If the task is already done, close after replay.
     const task = getTask(id);
-    if (task && (task.status === "succeeded" || task.status === "failed" || task.status === "cancelled")) {
+    if (
+      task &&
+      (task.status === "succeeded" ||
+        task.status === "failed" ||
+        task.status === "cancelled")
+    ) {
       closed = true;
       off();
       return;
     }
-    // Heartbeat every 15s so proxies don't close the connection.
     while (!closed) {
       await new Promise((r) => setTimeout(r, 15_000));
       if (closed) break;
@@ -179,8 +154,3 @@ tasksRouter.get("/:id/events", (c) => {
     }
   });
 });
-
-function truncate(s: string, n: number): string {
-  const oneLine = s.replace(/\s+/g, " ").trim();
-  return oneLine.length <= n ? oneLine : oneLine.slice(0, n - 1) + "…";
-}

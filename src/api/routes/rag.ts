@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { indexRepo } from "../../rag/indexer.js";
 import { retrieve } from "../../rag/retriever.js";
+import { auth } from "../middleware/auth.js";
 
 const Index = z.object({
   repo_id: z.string().min(1),
@@ -16,7 +17,7 @@ const Search = z.object({
 
 export const ragRouter = new Hono();
 
-ragRouter.post("/index", async (c) => {
+ragRouter.post("/index", auth({ scope: "write" }), async (c) => {
   const parsed = Index.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: "invalid_input" }, 400);
   const stats = await indexRepo({
@@ -26,7 +27,7 @@ ragRouter.post("/index", async (c) => {
   return c.json({ stats });
 });
 
-ragRouter.post("/search", async (c) => {
+ragRouter.post("/search", auth({ scope: "read" }), async (c) => {
   const parsed = Search.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: "invalid_input" }, 400);
   const results = await retrieve({
