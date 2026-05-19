@@ -28,8 +28,18 @@ program
   .option("--no-critique", "Disable self-critique pass")
   .option("--quiet", "Suppress streaming event output", false)
   .action(async (
-    prompt,
-    options,
+    prompt: string,
+    options: {
+      workspace: string;
+      session?: string;
+      user?: string;
+      tier?: string;
+      model?: string;
+      budget?: string;
+      plan?: boolean;
+      critique?: boolean;
+      quiet: boolean;
+    },
   ) => {
     try {
       loadConfig();
@@ -39,7 +49,7 @@ program
         source: "cli",
         session_id: options.session,
         user_id: options.user,
-        force_tier: options.tier,
+        force_tier: options.tier as never,
         force_model: options.model,
         budget_usd: options.budget ? Number(options.budget) : undefined,
         plan_mode: options.plan,
@@ -65,7 +75,7 @@ program
   .command("tasks")
   .description("List recent tasks")
   .option("-n, --limit <n>", "Max rows", "20")
-  .action((opts) => {
+  .action((opts: { limit: string }) => {
     for (const t of listTasks(Number(opts.limit))) {
       const when = new Date(t.created_at).toISOString();
       process.stdout.write(
@@ -78,7 +88,7 @@ program
   .command("show")
   .description("Show the message + tool-call log for a task")
   .argument("<id>", "Task ID")
-  .action((id) => {
+  .action((id: string) => {
     const task = getTask(id);
     if (!task) {
       process.stderr.write(`no such task: ${id}\n`);
@@ -109,7 +119,7 @@ program
   .description("Index a repo for RAG retrieval (real Voyage AI embeddings)")
   .requiredOption("--repo-id <id>", "Logical repo identifier")
   .requiredOption("--path <path>", "Local path to the repo on disk")
-  .action(async (opts) => {
+  .action(async (opts: { repoId: string; path: string }) => {
     try {
       loadConfig();
       const stats = await indexRepo({ repoId: opts.repoId, repoRoot: opts.path });
@@ -150,7 +160,7 @@ program
   .command("worker")
   .description("Start a background worker that processes the durable job queue")
   .option("-c, --concurrency <n>", "Max concurrent jobs", "1")
-  .action(async (opts) => {
+  .action(async (opts: { concurrency: string }) => {
     try {
       loadConfig();
       const w = startWorker({ concurrency: Number(opts.concurrency) });
@@ -176,8 +186,8 @@ tokenCmd
   .requiredOption("--user <id>", "User id this token belongs to")
   .requiredOption("--name <name>", "Human-readable name")
   .option("--scope <scope>", "read | write | admin", "write")
-  .action((opts) => {
-    const scope = opts.scope;
+  .action((opts: { user: string; name: string; scope: string }) => {
+    const scope = opts.scope as Scope;
     if (!["read", "write", "admin"].includes(scope)) {
       process.stderr.write("scope must be one of read|write|admin\n");
       process.exit(1);
@@ -195,7 +205,7 @@ tokenCmd
   .command("list")
   .description("List tokens")
   .option("--user <id>", "Filter by user")
-  .action((opts) => {
+  .action((opts: { user?: string }) => {
     for (const t of listTokens(opts.user)) {
       process.stdout.write(
         `${t.id}\t${t.scope.padEnd(6)}\t${t.user_id}\t${t.name}` +
@@ -208,7 +218,7 @@ tokenCmd
 tokenCmd
   .command("revoke <id>")
   .description("Revoke a token")
-  .action((id) => {
+  .action((id: string) => {
     revokeToken(id);
     process.stdout.write(`revoked ${id}\n`);
   });
@@ -217,7 +227,7 @@ program
   .command("sessions")
   .description("List recent sessions")
   .option("-n, --limit <n>", "Max rows", "20")
-  .action((opts) => {
+  .action((opts: { limit: string }) => {
     for (const s of listSessions(Number(opts.limit))) {
       const when = new Date(s.updated_at).toISOString();
       process.stdout.write(
@@ -226,7 +236,7 @@ program
     }
   });
 
-function printEvent(e) {
+function printEvent(e: import("./agent/runner.js").AgentEvent) {
   switch (e.type) {
     case "task_created":
       process.stdout.write(`▶ task ${e.task.id} (${e.task.model})\n`);
@@ -283,12 +293,12 @@ function printEvent(e) {
   }
 }
 
-function truncate(s, n) {
+function truncate(s: string, n: number): string {
   const one = s.replace(/\s+/g, " ").trim();
   return one.length <= n ? one : one.slice(0, n - 1) + "…";
 }
 
-function msgOf(e) {
+function msgOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
