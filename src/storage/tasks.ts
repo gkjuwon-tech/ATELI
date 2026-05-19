@@ -22,6 +22,11 @@ export interface Task {
   output_tokens: number;
   source: string;
   source_ref: string | null;
+  session_id: string | null;
+  user_id: string | null;
+  cost_usd: number;
+  plan_json: string | null;
+  interject_pending: string | null;
 }
 
 export interface ToolCallRow {
@@ -51,13 +56,15 @@ export function createTask(args: {
   model: string;
   source?: string;
   source_ref?: string;
+  session_id?: string;
+  user_id?: string;
 }): Task {
   const now = Date.now();
   const id = `tsk_${nanoid(16)}`;
   const db = getDb();
   db.prepare(
-    `INSERT INTO tasks (id, created_at, updated_at, workspace, prompt, status, model, source, source_ref)
-     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    `INSERT INTO tasks (id, created_at, updated_at, workspace, prompt, status, model, source, source_ref, session_id, user_id)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
   ).run(
     id,
     now,
@@ -67,8 +74,40 @@ export function createTask(args: {
     args.model,
     args.source ?? "cli",
     args.source_ref ?? null,
+    args.session_id ?? null,
+    args.user_id ?? null,
   );
   return getTask(id)!;
+}
+
+export function setTaskPlan(id: string, plan: unknown) {
+  getDb()
+    .prepare(`UPDATE tasks SET plan_json = ?, updated_at = ? WHERE id = ?`)
+    .run(JSON.stringify(plan), Date.now(), id);
+}
+
+export function addTaskCost(id: string, deltaUsd: number) {
+  getDb()
+    .prepare(
+      `UPDATE tasks SET cost_usd = cost_usd + ?, updated_at = ? WHERE id = ?`,
+    )
+    .run(deltaUsd, Date.now(), id);
+}
+
+export function setTaskInterject(id: string, text: string | null) {
+  getDb()
+    .prepare(`UPDATE tasks SET interject_pending = ? WHERE id = ?`)
+    .run(text, id);
+}
+
+export function takeTaskInterject(id: string): string | null {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT interject_pending FROM tasks WHERE id = ?`)
+    .get(id) as { interject_pending: string | null } | undefined;
+  if (!row?.interject_pending) return null;
+  db.prepare(`UPDATE tasks SET interject_pending = NULL WHERE id = ?`).run(id);
+  return row.interject_pending;
 }
 
 export function getTask(id: string): Task | null {
