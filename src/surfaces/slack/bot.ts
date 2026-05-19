@@ -28,12 +28,20 @@ export function buildApp() {
   });
 
   app.event("app_mention", async ({ event, client, say }) => {
+    // Slack threads: thread_ts is the parent message's ts when in a thread.
+    // Fall back to the current message's ts for top-level mentions (which
+    // start their own thread). This makes every reply in the same thread
+    // share an ateli session.
+    type Ev = typeof event & { thread_ts?: string; user?: string };
+    const ev = event as Ev;
+    const threadId = ev.thread_ts ?? ev.ts;
+    const userId = ev.user;
     // Strip the bot mention prefix.
     const text = event.text.replace(/^<@[A-Z0-9]+>\s*/, "").trim();
     const m = PARSE.exec(text);
     if (!m) {
       await say({
-        thread_ts: event.ts,
+        thread_ts: threadId,
         text:
           "Usage: `@ateli [rag:<repo-id>] <owner>/<repo>[branch] <task>`\n" +
           "Example: `@ateli acme/api add a /health endpoint returning {ok:true}`",
@@ -47,7 +55,7 @@ export function buildApp() {
     const prompt = m[5]!.trim();
 
     const ack = await say({
-      thread_ts: event.ts,
+      thread_ts: threadId,
       text: `:gear: cloning ${owner}/${repo}@${base}…`,
     });
 
@@ -71,14 +79,15 @@ export function buildApp() {
         prompt,
         workspace: cloned.dir,
         source: "slack",
-        source_ref: `${event.channel}:${event.ts}`,
+        source_ref: `${event.channel}:${threadId}`,
+        user_id: userId,
         ragContext,
-        onEvent: (ev) => {
-          if (ev.type === "tool_call") {
+        onEvent: (agentEv) => {
+          if (agentEv.type === "tool_call") {
             void client.chat.postMessage({
               channel: event.channel,
-              thread_ts: event.ts,
-              text: `\`${ev.tool_name}\` ${truncate(JSON.stringify(ev.input), 200)}`,
+              thread_ts: threadId,
+              text: `\`${agentEv.tool_name}\` ${truncate(JSON.stringify(agentEv.input), 200)}`,
             });
           }
         },
@@ -97,17 +106,17 @@ export function buildApp() {
       });
 
       if (pr) {
-        await say({ thread_ts: event.ts, text: `:tada: PR: ${pr.url}` });
+        await say({ thread_ts: threadId, text: `:tada: PR: ${pr.url}` });
       } else {
         await say({
-          thread_ts: event.ts,
+          thread_ts: threadId,
           text: ":information_source: no changes to commit; nothing to PR",
         });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error({ err: msg }, "slack handler failed");
-      await say({ thread_ts: event.ts, text: `:x: error: ${msg}` });
+      await say({ thread_ts: threadId, text: `:x: error: ${msg}` });
     } finally {
       cloned?.cleanup();
     }
