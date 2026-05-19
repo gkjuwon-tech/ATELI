@@ -20,29 +20,34 @@ export const DASHBOARD_HTML = `<!doctype html>
   .task .prompt { font-weight: 500; margin-top: 2px; }
   .task .meta { font-size: 11px; color: #8888; margin-top: 4px; display: flex; gap: 8px; }
   .pill { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 11px; }
-  .pending { background: #8884; }
+  .pending, .queued { background: #8884; }
   .running { background: #4af4; color: #4af; }
   .succeeded { background: #4a44; color: #4a4; }
   .failed { background: #f444; color: #f44; }
   .cancelled { background: #8888; }
-  #detail { overflow-y: auto; padding: 16px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+  #detail-wrap { display: flex; flex-direction: column; }
+  #detail { overflow-y: auto; padding: 16px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; flex: 1; }
   .ev { padding: 4px 0; }
   .ev .label { color: #8aa; }
   .ev.error .label { color: #f66; }
   .ev .body { color: inherit; }
   form { padding: 12px; border-top: 1px solid #8884; display: grid; gap: 8px; }
+  #interject-row { padding: 8px 12px; border-top: 1px solid #8884; display: flex; gap: 8px; }
+  #interject-row input { flex: 1; }
   input, textarea, button { font: inherit; padding: 6px 8px; border: 1px solid #8884; border-radius: 4px; background: transparent; color: inherit; }
   textarea { resize: vertical; min-height: 60px; font-family: var(--mono); }
   button { cursor: pointer; background: #4af4; border-color: #4af8; }
   button:hover { background: #4af8; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .empty { color: #8888; padding: 24px; text-align: center; }
+  label.toggle { font-size: 12px; color: #8aa; display: flex; align-items: center; gap: 4px; }
 </style>
 </head>
 <body>
 <header>
   <h1>ateli</h1>
   <span class="muted" id="status">connecting…</span>
+  <span class="muted" id="auth-state"></span>
 </header>
 <main>
   <aside id="list">
@@ -51,17 +56,41 @@ export const DASHBOARD_HTML = `<!doctype html>
       <input id="workspace" placeholder="Workspace path (or leave blank for repo)" />
       <input id="repo" placeholder="owner/repo (optional, opens PR)" />
       <input id="base" placeholder="base branch (default: main)" />
+      <input id="rag_repo" placeholder="rag repo id (optional)" />
+      <input id="budget" type="number" step="0.01" placeholder="Budget USD (optional)" />
+      <div style="display:flex; gap: 12px;">
+        <label class="toggle"><input type="checkbox" id="plan" /> plan</label>
+        <label class="toggle"><input type="checkbox" id="critique" checked /> critique</label>
+      </div>
       <button type="submit">Start task</button>
     </form>
     <div id="tasks"><div class="empty">no tasks yet</div></div>
   </aside>
-  <section id="detail"><div class="empty">select a task</div></section>
+  <section id="detail-wrap">
+    <div id="detail"><div class="empty">select a task</div></div>
+    <div id="interject-row" style="display:none">
+      <input id="interject" placeholder="Interject: add guidance the agent will read next turn" />
+      <button id="interject-btn">Send</button>
+    </div>
+  </section>
 </main>
 <script>
-const state = { active: null, tasks: [], evtSource: null };
+const state = { active: null, tasks: [], evtSource: null, token: localStorage.getItem("ateli_token") || "" };
+
+function headers() {
+  return state.token ? { authorization: "Bearer " + state.token, "content-type": "application/json" }
+                     : { "content-type": "application/json" };
+}
+
+document.getElementById("auth-state").textContent = state.token ? "authed" : "anon";
 
 async function refresh() {
-  const r = await fetch("/v1/tasks");
+  const r = await fetch("/v1/tasks", { headers: headers() });
+  if (r.status === 401) {
+    const t = prompt("API token required:");
+    if (t) { localStorage.setItem("ateli_token", t); state.token = t; document.getElementById("auth-state").textContent = "authed"; return refresh(); }
+    return;
+  }
   const j = await r.json();
   state.tasks = j.tasks;
   renderList();
@@ -81,7 +110,8 @@ function renderList() {
       <div class="meta">
         <span class="pill \${t.status}">\${t.status}</span>
         <span>\${when}</span>
-        <span>\${t.input_tokens}↑ / \${t.output_tokens}↓ tok</span>
+        <span>\${t.input_tokens}↑ / \${t.output_tokens}↓</span>
+        <span>$\${(t.cost_usd||0).toFixed(4)}</span>
       </div>
     </div>\`;
   }).join("");
@@ -95,21 +125,22 @@ async function select(id) {
   renderList();
   const detail = document.getElementById("detail");
   detail.innerHTML = "loading…";
-  const r = await fetch("/v1/tasks/" + id);
+  const r = await fetch("/v1/tasks/" + id, { headers: headers() });
   const j = await r.json();
   detail.innerHTML = "";
-  for (const m of j.messages) {
-    appendEv(detail, m.role, m.content);
-  }
+  for (const m of j.messages) appendEv(detail, m.role, m.content);
   if (state.evtSource) state.evtSource.close();
-  if (j.task.status === "pending" || j.task.status === "running") {
-    state.evtSource = new EventSource("/v1/tasks/" + id + "/events");
+  const active = j.task.status === "pending" || j.task.status === "running";
+  document.getElementById("interject-row").style.display = active ? "flex" : "none";
+  if (active) {
+    state.evtSource = new EventSource("/v1/tasks/" + id + "/events" + (state.token ? "?token=" + encodeURIComponent(state.token) : ""));
     state.evtSource.onmessage = e => {
       try {
         const ev = JSON.parse(e.data);
         renderEvent(detail, ev);
         if (ev.type === "task_finished") {
           state.evtSource.close();
+          document.getElementById("interject-row").style.display = "none";
           refresh();
         }
       } catch {}
@@ -119,6 +150,12 @@ async function select(id) {
 
 function renderEvent(detail, ev) {
   switch (ev.type) {
+    case "routed":
+      appendEv(detail, "router", "tier=" + ev.tier + " model=" + ev.model + " — " + ev.rationale);
+      break;
+    case "plan":
+      appendEv(detail, "plan", ev.plan.steps.map(s => "[ ] " + s.id + ": " + s.title).join("\\n"));
+      break;
     case "turn_started":
       appendEv(detail, "turn", "— turn " + ev.turn + " —");
       break;
@@ -133,10 +170,22 @@ function renderEvent(detail, ev) {
         "(" + ev.duration_ms + "ms) " + ev.output.slice(0, 800));
       break;
     case "usage":
-      appendEv(detail, "usage", ev.input_tokens + "↑ / " + ev.output_tokens + "↓ tokens");
+      appendEv(detail, "usage", ev.input_tokens + "↑ / " + ev.output_tokens + "↓ — $" + ev.cost_usd.toFixed(4));
+      break;
+    case "interject":
+      appendEv(detail, "interject", ev.text);
+      break;
+    case "budget_warn":
+      appendEv(detail, "budget", "80%+ used: $" + ev.spent_usd.toFixed(4) + " / $" + ev.budget_usd.toFixed(2));
+      break;
+    case "budget_exceeded":
+      appendEv(detail, "result-err", "BUDGET EXCEEDED — stopping");
+      break;
+    case "critique":
+      appendEv(detail, "critique", ev.results.map(r => (r.verdict.pass ? "✓" : "✗") + " " + r.persona + ": " + r.verdict.issues.length + " issue(s)").join("\\n"));
       break;
     case "task_finished":
-      appendEv(detail, "done", ev.task.status);
+      appendEv(detail, "done", ev.task.status + " ($" + (ev.task.cost_usd||0).toFixed(4) + ")");
       break;
   }
   detail.scrollTop = detail.scrollHeight;
@@ -161,24 +210,44 @@ document.getElementById("new").onsubmit = async (e) => {
     workspace: document.getElementById("workspace").value || undefined,
     repo: document.getElementById("repo").value || undefined,
     base: document.getElementById("base").value || undefined,
+    rag_repo: document.getElementById("rag_repo").value || undefined,
+    budget_usd: Number(document.getElementById("budget").value) || undefined,
+    plan_mode: document.getElementById("plan").checked,
+    critique: document.getElementById("critique").checked,
   };
   if (!body.workspace && !body.repo) {
     alert("Provide a workspace path or a repo");
     return;
   }
-  const r = await fetch("/v1/tasks", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    alert("failed: " + (await r.text()));
-    return;
-  }
+  const r = await fetch("/v1/tasks", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  if (!r.ok) { alert("failed: " + (await r.text())); return; }
   const j = await r.json();
+  // poll job until it has a task_id, then jump to that task.
   document.getElementById("prompt").value = "";
-  await refresh();
-  select(j.task.id);
+  await pollJob(j.job_id);
+};
+
+async function pollJob(jobId) {
+  for (let i = 0; i < 60; i++) {
+    const r = await fetch("/v1/tasks/jobs/" + jobId, { headers: headers() });
+    if (r.ok) {
+      const j = await r.json();
+      if (j.job.task_id) { await refresh(); select(j.job.task_id); return; }
+      if (j.job.status === "failed") { alert("job failed: " + j.job.error); return; }
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
+document.getElementById("interject-btn").onclick = async () => {
+  if (!state.active) return;
+  const text = document.getElementById("interject").value.trim();
+  if (!text) return;
+  const r = await fetch("/v1/tasks/" + state.active + "/interject", {
+    method: "POST", headers: headers(), body: JSON.stringify({ text }),
+  });
+  if (r.ok) { document.getElementById("interject").value = ""; }
+  else { alert("failed: " + (await r.text())); }
 };
 
 document.getElementById("status").textContent = "ready";
